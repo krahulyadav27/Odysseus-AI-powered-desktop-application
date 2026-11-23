@@ -1,0 +1,750 @@
+"""Tests for context_compactor.py — constants and prompt templates.
+Uses mock imports to avoid loading the full app stack."""
+
+import asyncio
+import sys
+from unittest.mock import MagicMock
+
+import pytest
+
+# Mock heavy dependencies before importing
+for mod in [
+    'sqlalchemy', 'sqlalchemy.orm', 'sqlalchemy.ext', 'sqlalchemy.ext.declarative',
+    'sqlalchemy.ext.hybrid', 'sqlalchemy.sql', 'sqlalchemy.sql.expression',
+    'src.database',
+    'core.models', 'core.database',
+]:
+    if mod not in sys.modules:
+        sys.modules[mod] = MagicMock()
+
+import src.context_compactor as cc
+from src.context_compactor import (
+    COMPACT_THRESHOLD,
+    SELF_SUMMARY_SYSTEM_PROMPT,
+    SUMMARY_MAX_TOKENS,
+    _content_as_text,
+    maybe_compact,
+    trim_for_context,
+)
+from src.model_context import estimate_text_tokens, estimate_tokens
+
+
+class TestCompactThreshold:
+    def test_value(self):
+        assert COMPACT_THRESHOLD == 0.85
+
+    def test_summary_max_tokens(self):
+        assert SUMMARY_MAX_TOKENS == 1024
+
+
+class TestSelfSummaryPrompt:
+    def test_contains_goal_section(self):
+        assert "### User Goal" in SELF_SUMMARY_SYSTEM_PROMPT
+
+    def test_contains_what_was_done_section(self):
+        assert "### What Was Done" in SELF_SUMMARY_SYSTEM_PROMPT
+
+    def test_contains_current_state_section(self):
+        assert "### Current State" in SELF_SUMMARY_SYSTEM_PROMPT
+
+    def test_contains_pending_section(self):
+        assert "### Pending / Next Steps" in SELF_SUMMARY_SYSTEM_PROMPT
+
+    def test_contains_key_context_section(self):
+        assert "### Key Context" in SELF_SUMMARY_SYSTEM_PROMPT
+
+    def test_count_placeholder(self):
+        assert "{count}" in SELF_SUMMARY_SYSTEM_PROMPT
+
+    def test_n_placeholder(self):
+        assert "{n}" in SELF_SUMMARY_SYSTEM_PROMPT
+
+    def test_mentions_compactions(self):
+        assert "Compactions so far" in SELF_SUMMARY_SYSTEM_PROMPT
+
+
+class TestTrimForContext:
+    def test_dense_unicode_current_message_is_trimmed_to_budget(self):
+        messages = [
+            {"role": "system", "content": "Keep the active request."},
+            {"role": "user", "content": "\ufffd" * 5000},
+        ]
+
+        trimmed = trim_for_context(messages, context_length=1024, reserve_tokens=256)
+
+        assert trimmed[-1]["role"] == "user"
+        assert "pasted message was too large" in trimmed[-1]["content"]
+        assert estimate_tokens(trimmed) <= 768
+
+    def test_dense_unicode_tool_arguments_use_shared_estimator(self):
+        messages = [
+            {"role": "system", "content": "Use tools."},
+            {"role": "user", "content": "Create the artifact."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": "\ufffd" * 5000,
+                    },
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "created"},
+        ]
+
+        trimmed = trim_for_context(messages, context_length=1024, reserve_tokens=256)
+
+        assistant = next(message for message in trimmed if message.get("tool_calls"))
+        args = assistant["tool_calls"][0]["function"]["arguments"]
+        assert "_truncated_for_context" in args
+        assert estimate_tokens(trimmed) <= 768
+
+    def test_system_truncation_preserves_internal_route_metadata(self):
+        messages = [
+            {
+                "role": "system",
+                "content": "persona\n\n" + ("agent prompt " * 2000),
+                "_agent_injected": "merged_prompt",
+                "_agent_base_message": {"role": "system", "content": "persona"},
+            },
+            {"role": "user", "content": "latest"},
+        ]
+
+        trimmed = trim_for_context(messages, context_length=1024, reserve_tokens=256)
+
+        system = next(message for message in trimmed if message.get("role") == "system")
+        assert system["_agent_injected"] == "merged_prompt"
+        assert system["_agent_base_message"] == {"role": "system", "content": "persona"}
+
+    def test_compaction_summary_survives_large_route_prompt_trim(self):
+        messages = [
+            {"role": "system", "content": "route prompt " * 8000},
+            {
+                "role": "system",
+                "content": "[Conversation summary]\nThe active coding task is still in progress; run verification next.",
+            },
+            {"role": "user", "content": "continue the coding task"},
+        ]
+
+        trimmed = trim_for_context(messages, context_length=2048, reserve_tokens=512)
+
+        assert any(
+            str(message.get("content", "")).startswith("[Conversation summary]")
+            for message in trimmed
+        )
+
+    def test_keeps_current_large_user_message_by_truncating(self):
+        huge = "A" * 20000
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": huge},
+        ]
+
+        trimmed = trim_for_context(messages, context_length=2048, reserve_tokens=512)
+
+        user_msgs = [m for m in trimmed if m.get("role") == "user"]
+        assert len(user_msgs) == 1
+        content = user_msgs[0]["content"]
+        assert "pasted message was too large" in content
+        assert content.startswith("A")
+        assert len(content) < len(huge)
+
+    def test_drops_older_messages_before_latest_user_paste(self):
+        huge = "B" * 12000
+        messages = [{"role": "system", "content": "You are helpful."}]
+        messages.extend({"role": "user", "content": f"old-{i} " + ("x" * 1000)} for i in range(8))
+        messages.append({"role": "user", "content": huge})
+
+        trimmed = trim_for_context(messages, context_length=2048, reserve_tokens=512)
+
+        assert trimmed[-1]["role"] == "user"
+        assert "pasted message was too large" in trimmed[-1]["content"]
+        assert "old-0" not in "\n".join(str(m.get("content", "")) for m in trimmed)
+
+    def test_keeps_latest_user_request_before_bulky_tool_outputs(self):
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "test"},
+            {"role": "assistant", "content": "Test received."},
+            {
+                "role": "user",
+                "content": "My son found regular snail with shell and it makes bubbles. Is it poisonous?",
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": '{"query":"are garden snails poisonous to touch"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "garden snail result " * 2000},
+        ]
+
+        trimmed = trim_for_context(messages, context_length=2048, reserve_tokens=512)
+        joined = "\n".join(str(m.get("content", "")) for m in trimmed)
+
+        assert "snail" in joined
+        assert "poisonous" in joined
+        assert "Test received" not in joined
+
+    def test_textual_tool_result_does_not_replace_active_user_request(self):
+        messages = [
+            {"role": "system", "content": "Follow the active request."},
+            {
+                "role": "user",
+                "content": "Apply both changes, inspect the resulting state, and report it.",
+            },
+            {"role": "assistant", "content": "first tool call " * 300},
+            {
+                "role": "user",
+                "content": "UNTRUSTED SOURCE DATA\n" + ("first result " * 500),
+                "metadata": {
+                    "trusted": False,
+                    "source": "tool execution results",
+                },
+            },
+            {"role": "assistant", "content": "second tool call " * 300},
+            {
+                "role": "user",
+                "content": "UNTRUSTED SOURCE DATA\n" + ("second result " * 500),
+                "metadata": {
+                    "trusted": False,
+                    "source": "tool execution results",
+                },
+            },
+        ]
+
+        trimmed = trim_for_context(messages, context_length=1024, reserve_tokens=512)
+        joined = "\n".join(str(message.get("content", "")) for message in trimmed)
+
+        assert "Apply both changes" in joined
+        assert "inspect the resulting state" in joined
+
+    @pytest.mark.parametrize('is_control', [True, False])
+    def test_recovery_provenance_not_wording_selects_the_user_request(self, is_control):
+        original = {'role': 'user', 'content': 'Find a product and return its price and URL.'}
+        correction = {'role': 'user', 'content': 'The tool-call budget is exhausted. Explain what happened.'}
+        if is_control:
+            correction['_harness_control'] = True
+        messages = [
+            {'role': 'system', 'content': 'Answer from evidence.'}, original,
+            {'role': 'assistant', 'content': 'Page evidence ' * 3000}, correction,
+        ]
+        trimmed = trim_for_context(messages, context_length=2048, reserve_tokens=512)
+        assert correction in trimmed
+        assert (original in trimmed) == is_control
+
+
+class TestContentAsText:
+    def test_string_passthrough(self):
+        assert _content_as_text("hello") == "hello"
+
+    def test_none_returns_empty(self):
+        # Assistant turns that carried only native tool_calls persist
+        # content as None — flattening must not raise.
+        assert _content_as_text(None) == ""
+
+    def test_list_content_joins_text_blocks(self):
+        content = [
+            {"type": "text", "text": "describe this"},
+            {"type": "image_url", "image_url": {"url": "data:..."}},
+        ]
+        assert _content_as_text(content) == "describe this"
+
+    def test_unknown_type_returns_empty(self):
+        assert _content_as_text(42) == ""
+
+
+def test_prune_multimodal_images_keeps_text_and_uniform_visual_coverage():
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Inspect the complete recording."},
+            *[
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,frame-{index}"},
+                }
+                for index in range(20)
+            ],
+        ],
+    }]
+
+    pruned = cc.prune_multimodal_images(messages, max_images=4)
+    content = pruned[0]["content"]
+    images = [item for item in content if item.get("type") == "image_url"]
+
+    assert content[0]["text"] == "Inspect the complete recording."
+    assert len(images) == 4
+    assert images[0]["image_url"]["url"].endswith("frame-0")
+    assert images[-1]["image_url"]["url"].endswith("frame-19")
+
+
+class TestMaybeCompactFourthMessage:
+    """Regression: a multi-message conversation must not crash compaction when
+    a prior assistant turn used native tool_calls (content == None). This was
+    the '4th message stops working' bug — on a small-context model the soft
+    85% threshold is crossed after a few turns, and the older half being
+    summarized contained a None-content assistant message, which raised
+    TypeError: 'NoneType' object is not subscriptable and broke the request."""
+
+    def _run(self, messages, *, context_length=500):
+        # Force compaction to trigger and stub the summary LLM call so the test
+        # is hermetic (no network, no real endpoint resolution).
+        orig_ctx = cc.get_context_length
+        orig_call = cc.llm_call_async
+        orig_resolve = cc.resolve_endpoint
+        orig_update = cc._update_session_history
+
+        async def _fake_summary(*a, **k):
+            return "compact summary text"
+
+        cc.get_context_length = lambda url, model: context_length
+        cc.llm_call_async = _fake_summary
+        def fake_resolve_endpoint(which, **kwargs):
+            assert which == "utility"
+            assert kwargs["fallback_url"] == "http://local/v1/chat/completions"
+            assert kwargs["fallback_model"] == "local-model"
+            assert kwargs["fallback_headers"] == {}
+            return None, None, None
+
+        cc.resolve_endpoint = fake_resolve_endpoint
+        cc._update_session_history = lambda *a, **k: None
+        try:
+            return asyncio.run(
+                maybe_compact(
+                    session=None,
+                    endpoint_url="http://local/v1/chat/completions",
+                    model="local-model",
+                    messages=list(messages),
+                    headers={},
+                )
+            )
+        finally:
+            cc.get_context_length = orig_ctx
+            cc.llm_call_async = orig_call
+            cc.resolve_endpoint = orig_resolve
+            cc._update_session_history = orig_update
+
+    def _four_turn_history_with_tool_call(self):
+        # Large system prompt so the conversation crosses the 85% threshold of
+        # the tiny (context_length=500) window used in _run, forcing the real
+        # compaction branch to execute.
+        return [
+            {"role": "system", "content": "You are a helpful agent. " * 200},
+            {"role": "user", "content": "turn 1: search the web"},
+            # Native tool call → content is None (matches agent_loop persistence)
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "web_search", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "search results"},
+            {"role": "assistant", "content": "Here is what I found."},
+            {"role": "user", "content": "turn 2"},
+            {"role": "assistant", "content": "reply 2"},
+            {"role": "user", "content": "turn 3"},
+            {"role": "assistant", "content": "reply 3"},
+            {"role": "user", "content": "turn 4 — previously broke here"},
+        ]
+
+    def test_does_not_crash_on_none_content_turn(self):
+        # Must not raise TypeError; returns the 3-tuple contract.
+        result = self._run(self._four_turn_history_with_tool_call())
+        assert isinstance(result, tuple) and len(result) == 3
+        compacted_messages, context_length, was_compacted = result
+        assert isinstance(compacted_messages, list)
+        assert was_compacted is True
+        # The summary the model produced is present and a system message.
+        assert any(
+            m.get("role") == "system" and "compact summary text" in (m.get("content") or "")
+            for m in compacted_messages
+        )
+
+    def test_handles_multimodal_list_content(self):
+        messages = self._four_turn_history_with_tool_call()
+        messages[1] = {"role": "user", "content": [
+            {"type": "text", "text": "look at this image"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,xxxx"}},
+        ]}
+        result = self._run(messages)
+        assert len(result) == 3 and result[2] is True
+
+
+@pytest.mark.asyncio
+async def test_deferred_compaction_persists_only_after_route_commit(monkeypatch):
+    updates = []
+    state = {}
+    messages = [
+        {"role": "system", "content": "system " * 100},
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+        {"role": "user", "content": "five"},
+    ]
+
+    monkeypatch.setattr(cc, "get_context_length", lambda *args: 100)
+    monkeypatch.setattr(cc, "resolve_endpoint", lambda *args, **kwargs: (None, None, None))
+
+    async def fake_summary(*args, **kwargs):
+        return "route-specific summary"
+
+    monkeypatch.setattr(cc, "llm_call_async", fake_summary)
+    monkeypatch.setattr(
+        cc,
+        "_update_session_history",
+        lambda *args, **kwargs: updates.append((args, kwargs)),
+    )
+
+    _compacted, _context, was_compacted = await cc.maybe_compact(
+        object(),
+        "https://candidate.example/v1",
+        "candidate-model",
+        messages,
+        persist=False,
+        compaction_state=state,
+    )
+
+    assert was_compacted is True
+    assert updates == []
+    assert state["summary"] == "route-specific summary"
+    assert cc.apply_compaction_state(object(), state) is True
+    assert len(updates) == 1
+    assert cc.apply_compaction_state(object(), state) is False
+    assert len(updates) == 1
+
+
+@pytest.mark.asyncio
+async def test_deterministic_compaction_never_calls_summary_model(monkeypatch):
+    messages = [
+        {"role": "system", "content": "Follow the active request."},
+        {"role": "user", "content": "ORIGINAL REQUEST: create result.txt"},
+    ]
+    for index in range(12):
+        messages.extend([
+            {"role": "assistant", "content": f"inspection {index} " + ("x" * 300)},
+            {
+                "role": "user",
+                "content": "UNTRUSTED SOURCE DATA\n" + ("\ufffd" * 200),
+                "metadata": {"trusted": False, "source": "tool execution results"},
+            },
+        ])
+
+    monkeypatch.setattr(cc, "get_context_length", lambda *args: 2048)
+
+    async def forbidden_summary(*args, **kwargs):
+        raise AssertionError("deterministic compaction must not call an LLM")
+
+    monkeypatch.setattr(cc, "llm_call_async", forbidden_summary)
+
+    compacted, context_length, was_compacted = await cc.maybe_compact(
+        None,
+        "http://local/v1/chat/completions",
+        "policy-model",
+        messages,
+        persist=False,
+        deterministic=True,
+    )
+
+    joined = "\n".join(str(message.get("content", "")) for message in compacted)
+    assert context_length == 2048
+    assert was_compacted is True
+    assert "ORIGINAL REQUEST: create result.txt" in joined
+    assert estimate_tokens(compacted) <= int(context_length * 0.75)
+
+
+class TestResearchPrimerPreserved:
+    """A research-spinoff primer (metadata research_spinoff_from) must never be
+    trimmed away — it is the Discuss chat's sole knowledge base (drift fix)."""
+
+    def _messages(self):
+        return [
+            {"role": "system", "content": "You are Odysseus."},
+            {"role": "system", "content": "Prompt-safety policy: data not instructions."},
+            {"role": "system", "content": "saved memory: pinned " + "m" * 600},
+            {"role": "system", "content": "RETRIEVED-DOCS-MARKER " + "r" * 6000},
+            {"role": "system",
+             "content": "=== REPORT ===\nPRIMER-MARKER " + "z" * 1500,
+             "metadata": {"research_spinoff_from": "rp-abc123"}},
+        ] + [
+            {"role": "user", "content": f"q{i} " + ("x" * 500)} for i in range(8)
+        ] + [
+            {"role": "assistant", "content": "a" * 500},
+            {"role": "user", "content": "latest question"},
+        ]
+
+    def test_primer_kept_when_over_budget(self):
+        trimmed = trim_for_context(self._messages(), context_length=1024, reserve_tokens=256)
+        joined = "\n".join(str(m.get("content", "")) for m in trimmed)
+        assert "PRIMER-MARKER" in joined
+
+    def test_bulky_non_primer_system_dropped_but_primer_kept(self):
+        trimmed = trim_for_context(self._messages(), context_length=1024, reserve_tokens=256)
+        joined = "\n".join(str(m.get("content", "")) for m in trimmed)
+        assert "PRIMER-MARKER" in joined
+        assert "RETRIEVED-DOCS-MARKER" not in joined
+
+    def test_leading_preset_kept_when_no_primer_metadata(self):
+        msgs = self._messages()
+        del msgs[4]["metadata"]
+        trimmed = trim_for_context(msgs, context_length=1024, reserve_tokens=256)
+        joined = "\n".join(str(m.get("content", "")) for m in trimmed)
+        assert "You are Odysseus." in joined
+
+
+def test_unterminated_image_label_with_long_whitespace_finishes_promptly():
+    """Untrusted captions must not make image-history compaction quadratic."""
+    import subprocess
+    import sys
+
+    script = '''
+from src.context_compactor import keep_recent_image_turns
+messages = [
+    {'role': 'user', 'content': [{'type': 'text', 'text': '[Image:' + ' ' * 100000},
+                                 {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,AA=='}}]},
+    {'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,AA=='}}]},
+]
+assert '[Image]' in keep_recent_image_turns(messages, keep=1)[0]['content'][0]['text']
+'''
+    subprocess.run([sys.executable, '-c', script], check=True, timeout=8)
+
+
+class TestSanitizeToolMessagesPredecessor:
+    """``_sanitize_tool_messages`` must return a transcript that satisfies the
+    provider ordering contract and is stable under repeated sanitation.
+
+    Contract under test:
+      - an assistant ``tool_calls`` turn follows a user or tool turn;
+      - every tool message belongs to a preceding ``tool_calls`` batch;
+      - an assistant ``tool_calls`` turn has at least one tool response.
+    """
+
+    @staticmethod
+    def _violations(msgs):
+        problems = []
+        in_batch = False
+        for i, m in enumerate(msgs):
+            role = m.get("role")
+            if role == "tool":
+                if not in_batch:
+                    problems.append(f"[{i}] orphan tool message")
+                continue
+            prev = msgs[i - 1] if i else None
+            prev_role = prev.get("role") if prev else None
+            if role == "assistant" and m.get("tool_calls"):
+                if prev_role not in ("user", "tool"):
+                    problems.append(f"[{i}] tool_calls after {prev_role!r}")
+                nxt = msgs[i + 1] if i + 1 < len(msgs) else None
+                if not (nxt and nxt.get("role") == "tool"):
+                    problems.append(f"[{i}] dangling tool_calls")
+                in_batch = True
+            else:
+                in_batch = False
+        return problems
+
+    def _sanitize(self, msgs):
+        result = cc._sanitize_tool_messages(msgs)
+        assert self._violations(result) == [], (
+            "sanitized transcript still violates the ordering contract: "
+            f"{self._violations(result)}"
+        )
+        assert cc._sanitize_tool_messages(result) == result, (
+            "sanitizing the sanitized transcript changed it"
+        )
+        return result
+
+    def test_user_then_calls_is_unchanged(self):
+        msgs = [
+            {"role": "user", "content": "search for X"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c1", "function": {"name": "web_search"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "results"},
+        ]
+        result = self._sanitize(msgs)
+        assert len(result) == 3
+        assert result[1].get("tool_calls") is not None
+
+    def test_second_batch_after_tool_response_is_unchanged(self):
+        """A call batch whose predecessor is a tool response is valid."""
+        msgs = [
+            {"role": "user", "content": "search for X"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c1", "function": {"name": "web_search"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "results"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c2", "function": {"name": "web_search"}}]},
+            {"role": "tool", "tool_call_id": "c2", "content": "more results"},
+        ]
+        result = self._sanitize(msgs)
+        assert len(result) == 5
+        assert result[3].get("tool_calls") is not None
+
+    def test_two_batch_mid_history_reaches_stable_result(self):
+        """A transcript that starts mid-history has no user/tool predecessor
+        for its first call batch. Dropping that batch leaves the second one
+        with no predecessor either, so the contract-valid, stable result is
+        empty; the sanitizer must not return the half-repaired transcript
+        where the second batch sits at the start without a predecessor.
+        """
+        msgs = [
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c1", "function": {"name": "web_search"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "results"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c2", "function": {"name": "web_search"}}]},
+            {"role": "tool", "tool_call_id": "c2", "content": "more results"},
+        ]
+        result = self._sanitize(msgs)
+        assert result == []
+
+    def test_assistant_text_then_completed_call_is_preserved(self):
+        """An assistant text turn directly before a completed call batch must
+        not cost the batch its tool_calls: the text is merged into the call
+        message so the executed call/result pair stays in the transcript.
+        """
+        msgs = [
+            {"role": "user", "content": "plan my day"},
+            {"role": "assistant", "content": "I'll check the calendar.",
+             "tool_calls": [{"id": "c1", "function": {"name": "manage_calendar"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "[]"},
+            {"role": "assistant", "content": "Found it."},
+            {"role": "assistant", "content": "Let me look at day two.",
+             "tool_calls": [{"id": "c2", "function": {"name": "manage_calendar"}}]},
+            {"role": "tool", "tool_call_id": "c2", "content": "[]"},
+        ]
+        result = self._sanitize(msgs)
+        assert len(result) == 5
+        assert result[1].get("tool_calls") is not None
+        merged = result[3]
+        assert merged.get("content") == "Found it.\n\nLet me look at day two."
+        assert merged.get("tool_calls") is not None
+        assert merged["tool_calls"][0]["id"] == "c2"
+
+    def test_assistant_text_directly_before_calls_merges(self):
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "Thinking out loud"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c1", "function": {"name": "web_search"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "results"},
+        ]
+        result = self._sanitize(msgs)
+        assert len(result) == 3
+        assert result[1]["content"] == "Thinking out loud"
+        assert result[1]["tool_calls"][0]["id"] == "c1"
+
+    def test_chain_of_text_turns_before_calls_merges_into_one(self):
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "one"},
+            {"role": "assistant", "content": "two"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c1", "function": {"name": "web_search"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "results"},
+        ]
+        result = self._sanitize(msgs)
+        assert len(result) == 3
+        assert result[1]["content"] == "one\n\ntwo"
+        assert result[1]["tool_calls"][0]["id"] == "c1"
+
+    def test_system_predecessor_calls_dropped(self):
+        msgs = [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c1", "function": {"name": "web_search"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "results"},
+        ]
+        result = self._sanitize(msgs)
+        assert [m["role"] for m in result] == ["system"]
+
+    def test_first_message_calls_dropped(self):
+        msgs = [
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c1", "function": {"name": "web_search"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "results"},
+        ]
+        assert self._sanitize(msgs) == []
+
+    def test_calls_with_content_after_system_keep_text(self):
+        msgs = [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "assistant", "content": "I'll search for you",
+             "tool_calls": [{"id": "c1", "function": {"name": "web_search"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "results"},
+        ]
+        result = self._sanitize(msgs)
+        assert [m["role"] for m in result] == ["system", "assistant"]
+        assert result[1].get("tool_calls") is None
+        assert "I'll search for you" in result[1]["content"]
+
+    def test_repeated_sanitation_is_stable_across_shapes(self):
+        shapes = [
+            [],
+            [{"role": "user", "content": "hi"}],
+            [{"role": "assistant", "content": None,
+              "tool_calls": [{"id": "c1", "function": {"name": "f"}}]}],
+            [{"role": "tool", "tool_call_id": "c1", "content": "x"}],
+            [{"role": "user", "content": "hi"},
+             {"role": "tool", "tool_call_id": "c1", "content": "x"}],
+            [{"role": "assistant", "content": "a"},
+             {"role": "assistant", "content": None,
+              "tool_calls": [{"id": "c1", "function": {"name": "f"}}]},
+             {"role": "tool", "tool_call_id": "c1", "content": "x"},
+             {"role": "assistant", "content": "b"},
+             {"role": "assistant", "content": "c",
+              "tool_calls": [{"id": "c2", "function": {"name": "f"}}]},
+             {"role": "tool", "tool_call_id": "c2", "content": "y"}],
+        ]
+        for msgs in shapes:
+            once = cc._sanitize_tool_messages(msgs)
+            assert self._violations(once) == []
+            assert cc._sanitize_tool_messages(once) == once
+
+    def test_input_messages_are_not_mutated(self):
+        import copy
+
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "text"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c1", "function": {"name": "f"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "x"},
+        ]
+        before = copy.deepcopy(msgs)
+        cc._sanitize_tool_messages(msgs)
+        assert msgs == before
+
+    @pytest.mark.parametrize("content", [
+        [{"type": "text", "text": "Keep observation"}],
+        [{"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}],
+        [],
+    ])
+    @pytest.mark.parametrize("dangling", [False, True])
+    def test_stripped_calls_preserve_multimodal_content(self, content, dangling):
+        if dangling:
+            messages = [
+                {"role": "user", "content": "Inspect image"},
+                {"role": "assistant", "content": content,
+                 "tool_calls": [{"id": "c1", "function": {"name": "inspect"}}]},
+            ]
+        else:
+            messages = [
+                {"role": "system", "content": "Instructions"},
+                {"role": "assistant", "content": content,
+                 "tool_calls": [{"id": "c1", "function": {"name": "inspect"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "orphan"},
+            ]
+        output = self._sanitize(messages)
+        expected = [messages[0]]
+        if content:
+            expected.append({"role": "assistant", "content": content})
+        assert output == expected
